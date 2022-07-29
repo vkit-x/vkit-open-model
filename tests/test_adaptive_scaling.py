@@ -1,10 +1,15 @@
 import torch
 from torch.utils.data import DataLoader
+from torchinfo import summary
 import numpy as np
 import iolite as io
 
 from vkit.element import Box, Mask, ScoreMap, Image, Painter
-from vkit_open_model.model.adaptive_scaling import AdaptiveScaling
+from vkit_open_model.model.adaptive_scaling import (
+    AdaptiveScaling,
+    AdaptiveScalingSize,
+    AdaptiveScalingNeckHeadType,
+)
 from vkit_open_model.dataset.adaptive_scaling import (
     adaptive_scaling_dataset_collate_fn,
     AdaptiveScalingIterableDataset,
@@ -13,7 +18,7 @@ from vkit_open_model.loss_function import AdaptiveScalingLossFunction
 
 
 def test_adaptive_scaling_jit():
-    model = AdaptiveScaling.create_tiny()
+    model = AdaptiveScaling(AdaptiveScalingSize.TINY, AdaptiveScalingNeckHeadType.UPERNEXT)
     model_jit = torch.jit.script(model)  # type: ignore
 
     x = torch.rand((1, 3, 320, 320))
@@ -22,21 +27,43 @@ def test_adaptive_scaling_jit():
     assert scale_feature.shape == (1, 1, 160, 160)
 
 
+def debug_adaptive_scaling_jit_model_summary():
+    print('AdaptiveScaling(BASE, FPN)')
+    model = AdaptiveScaling(AdaptiveScalingSize.BASE, AdaptiveScalingNeckHeadType.FPN)
+    model.eval()
+    print('depth=1')
+    summary(model, input_size=(1, 3, 640, 40), depth=1)
+    print('depth=3')
+    summary(model, input_size=(1, 3, 640, 40), depth=3)
+    print()
+
+    print('AdaptiveScaling(BASE, UPERNEXT)')
+    model = AdaptiveScaling(AdaptiveScalingSize.BASE, AdaptiveScalingNeckHeadType.UPERNEXT)
+    model.eval()
+    print('depth=1')
+    summary(model, input_size=(1, 3, 640, 40), depth=1)
+    print('depth=3')
+    summary(model, input_size=(1, 3, 640, 40), depth=3)
+    print()
+
+
 def test_adaptive_scaling_jit_loss_backward():
-    model = AdaptiveScaling.create_tiny()
+    model = AdaptiveScaling(AdaptiveScalingSize.TINY)
     model_jit = torch.jit.script(model)  # type: ignore
     del model
 
     loss_function = AdaptiveScalingLossFunction()
 
-    x = torch.rand((2, 3, 640, 640))
-    mask_feature, scale_feature = model_jit(x)  # type: ignore
+    with torch.autograd.profiler.profile() as prof:
+        x = torch.rand((2, 3, 640, 640))
+        mask_feature, scale_feature = model_jit(x)  # type: ignore
+    print(prof.key_averages().table(sort_by="self_cpu_time_total"))  # type: ignore
 
     loss = loss_function(
         mask_feature=mask_feature,
         scale_feature=scale_feature,
         downsampled_mask=(torch.rand(2, 300, 300) > 0.5).float(),
-        downsampled_score_map=torch.rand(2, 300, 300) + 5.0,
+        downsampled_score_map=torch.rand(2, 300, 300) + 8.75,
         downsampled_shape=(320, 320),
         downsampled_core_box=Box(up=10, down=309, left=10, right=309),
     )
@@ -44,7 +71,7 @@ def test_adaptive_scaling_jit_loss_backward():
 
 
 def sample_adaptive_scaling_dataset(
-    num_workers: int,
+    num_processes: int,
     batch_size: int,
     epoch_size: int,
     output_folder: str,
@@ -52,18 +79,22 @@ def sample_adaptive_scaling_dataset(
     out_fd = io.folder(output_folder, touch=True)
 
     num_samples = batch_size * epoch_size
-    data_loader = DataLoader(
-        dataset=AdaptiveScalingIterableDataset(
-            steps_json='$VKIT_ARTIFACT_PACK/pipeline/text_detection/adaptive_scaling.json',
-            num_samples=num_samples,
-            rng_seed=13370,
+    dataset = AdaptiveScalingIterableDataset(
+        steps_json=(
+            '$VKIT_ARTIFACT_PACK/pipeline/text_detection/dev_adaptive_scaling_dataset_steps.json'
         ),
+        num_samples=num_samples,
+        rng_seed=13,
+        num_processes=num_processes,
+    )
+    data_loader = DataLoader(
+        dataset,
         batch_size=batch_size,
-        num_workers=num_workers,
         collate_fn=adaptive_scaling_dataset_collate_fn,
     )
 
     for batch_idx, batch in enumerate(data_loader):
+        print(f'Saving batch_idx={batch_idx} ...')
         batch_image = batch['image']
         batch_downsampled_mask = batch['downsampled_mask']
         batch_downsampled_score_map = batch['downsampled_score_map']
@@ -110,23 +141,26 @@ def sample_adaptive_scaling_dataset(
             painter.paint_score_map(downsampled_score_map)
             painter.to_file(out_fd / f'{output_prefix}_downsampled_score_map.jpg')
 
+            painter = Painter.create(downsampled_image)
+            painter.paint_score_map(downsampled_score_map, alpha=1.0)
+            painter.to_file(out_fd / f'{output_prefix}_downsampled_score_map_alpha_1.jpg')
 
-def profile_adaptive_scaling_dataset(num_workers: int, batch_size: int, epoch_size: int):
+
+def profile_adaptive_scaling_dataset(num_processes: int, batch_size: int, epoch_size: int):
     from datetime import datetime
     from tqdm import tqdm
     import numpy as np
 
     num_samples = batch_size * epoch_size
-    rng_seed = list(range(num_samples))
 
     data_loader = DataLoader(
         dataset=AdaptiveScalingIterableDataset(
             steps_json='$VKIT_ARTIFACT_PACK/pipeline/text_detection/adaptive_scaling.json',
             num_samples=num_samples,
-            rng_seed=rng_seed,
+            rng_seed=13370,
+            num_processes=num_processes,
         ),
         batch_size=batch_size,
-        num_workers=num_workers,
         collate_fn=adaptive_scaling_dataset_collate_fn,
     )
 

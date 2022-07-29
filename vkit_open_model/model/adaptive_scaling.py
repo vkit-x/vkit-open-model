@@ -1,11 +1,12 @@
-from typing import List
+from typing import Tuple
 from enum import Enum, unique
 
 import torch
 from torch import nn
 
 from .convnext import ConvNext
-from .upernext import UperNext
+from .fpn import FpnNeck, FpnHead
+from .upernext import UperNextNeck, UperNextHead
 
 
 @unique
@@ -16,64 +17,69 @@ class AdaptiveScalingSize(Enum):
     LARGE = 'large'
 
 
+@unique
+class AdaptiveScalingNeckHeadType(Enum):
+    FPN = 'fpn'
+    UPERNEXT = 'upernext'
+
+
 class AdaptiveScaling(nn.Module):
 
     def __init__(
         self,
         size: AdaptiveScalingSize,
-        init_scale_output_bias: float = 5.0,
+        neck_head_type: AdaptiveScalingNeckHeadType = AdaptiveScalingNeckHeadType.FPN,
+        init_scale_output_bias: float = 8.0,
     ):
         super().__init__()
 
         if size == AdaptiveScalingSize.TINY:
             backbone_creator = ConvNext.create_tiny
-            head_creator = UperNext.create_tiny
-            head_mid_channels = 16
-
         elif size == AdaptiveScalingSize.SMALL:
             backbone_creator = ConvNext.create_small
-            head_creator = UperNext.create_small
-            head_mid_channels = 32
-
         elif size == AdaptiveScalingSize.BASE:
             backbone_creator = ConvNext.create_base
-            head_creator = UperNext.create_base
-            head_mid_channels = 32
-
         elif size == AdaptiveScalingSize.LARGE:
             backbone_creator = ConvNext.create_large
-            head_creator = UperNext.create_large
-            head_mid_channels = 64
-
         else:
             raise NotImplementedError()
 
-        self.backbone = backbone_creator(stem_use_pconv2x2=True)
-        self.mask_head = head_creator(out_channels=1, mid_channels=head_mid_channels)
-        self.scale_head = head_creator(
+        # 4x downsampling.
+        self.backbone = backbone_creator()
+
+        if neck_head_type == AdaptiveScalingNeckHeadType.FPN:
+            neck_creator = FpnNeck
+            head_creator = FpnHead
+        elif neck_head_type == AdaptiveScalingNeckHeadType.UPERNEXT:
+            neck_creator = UperNextNeck
+            head_creator = UperNextHead
+        else:
+            raise NotImplementedError()
+
+        neck_out_channels = self.backbone.in_channels_group[-2]
+
+        # Shared neck.
+        self.neck = neck_creator(
+            in_channels_group=self.backbone.in_channels_group,
+            out_channels=neck_out_channels,
+        )
+
+        # Two heads, 2x upsampling, leading to 2x E2E downsampling.
+        self.mask_head = head_creator(
+            in_channels=neck_out_channels,
             out_channels=1,
-            mid_channels=head_mid_channels,
+            upsampling_factor=2,
+        )
+        self.scale_head = head_creator(
+            in_channels=neck_out_channels,
+            out_channels=1,
+            upsampling_factor=2,
             init_output_bias=init_scale_output_bias,
         )
 
-    @staticmethod
-    def create_tiny():
-        return AdaptiveScaling(size=AdaptiveScalingSize.TINY)
-
-    @staticmethod
-    def create_small():
-        return AdaptiveScaling(size=AdaptiveScalingSize.SMALL)
-
-    @staticmethod
-    def create_base():
-        return AdaptiveScaling(size=AdaptiveScalingSize.BASE)
-
-    @staticmethod
-    def create_large():
-        return AdaptiveScaling(size=AdaptiveScalingSize.LARGE)
-
-    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:  # type: ignore
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:  # type: ignore
         features = self.backbone(x)
-        mask_feature = self.mask_head(features)
-        scale_feature = self.scale_head(features)
-        return [mask_feature, scale_feature]
+        neck_feature = self.neck(features)
+        mask_feature = self.mask_head(neck_feature)
+        scale_feature = self.scale_head(neck_feature)
+        return mask_feature, scale_feature

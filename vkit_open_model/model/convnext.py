@@ -117,6 +117,7 @@ class ConvNext(nn.Module):
         layer_idx_end = num_layers_sum - 1
 
         blocks: List[ConvNextBlock] = []
+        in_channels_group: List[int] = []
         for block_idx, (in_channels, num_layers) in enumerate(block_in_channels_and_num_layers):
             if block_idx + 1 < len(block_in_channels_and_num_layers):
                 out_channels = block_in_channels_and_num_layers[block_idx + 1][0]
@@ -131,8 +132,9 @@ class ConvNext(nn.Module):
                     out_channels=out_channels,
                 )
             )
+            in_channels_group.append(in_channels)
             layer_idx_begin += num_layers
-        return nn.ModuleList(blocks)
+        return nn.ModuleList(blocks), in_channels_group
 
     def __init__(
         self,
@@ -147,7 +149,7 @@ class ConvNext(nn.Module):
             block_in_channels=block_in_channels_and_num_layers[0][0],
             use_pconv2x2=stem_use_pconv2x2,
         )
-        self.blocks = self.build_blocks(block_in_channels_and_num_layers)
+        self.blocks, self.in_channels_group = self.build_blocks(block_in_channels_and_num_layers)
 
         for module in self.modules():
             if isinstance(module, (nn.Conv2d, nn.Linear)):

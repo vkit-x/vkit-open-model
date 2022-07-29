@@ -1,4 +1,4 @@
-from typing import Tuple, Generator, Optional, Iterable, Dict, List, Any, Union, Sequence
+from typing import Tuple, Optional, Iterable, Dict, List, Any, Sequence
 import logging
 
 import numpy as np
@@ -8,15 +8,15 @@ from torch.utils.data import IterableDataset, default_collate
 from vkit.element import Image, Mask, ScoreMap, Box
 from vkit.utility import PathType
 from vkit.pipeline import (
-    pipeline_step_collection_factory,
     PipelineState,
     PageCroppingStep,
     NoneTypePipelinePostProcessorConfig,
     PipelinePostProcessor,
     PipelinePostProcessorFactory,
     Pipeline,
+    PipelinePool,
+    pipeline_step_collection_factory,
 )
-from vkit_open_model.train import SecondOrderRandomGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -26,22 +26,24 @@ Sample = Tuple[Image, Tuple[int, int], Box, Mask, ScoreMap]
 class AdaptiveScalingPipelinePostProcessor(
     PipelinePostProcessor[
         NoneTypePipelinePostProcessorConfig,
-        Generator[Sample, None, None],
+        Sequence[Sample],
     ]
 ):  # yapf: disable
 
     def generate_output(self, state: PipelineState, rng: RandomGenerator):
         page_cropping_step_output = state.get_pipeline_step_output(PageCroppingStep)
+        samples: List[Sample] = []
         for cropped_page in page_cropping_step_output.cropped_pages:
             downsampled_label = cropped_page.downsampled_label
             assert downsampled_label
-            yield (
+            samples.append((
                 cropped_page.page_image,
                 downsampled_label.shape,
                 downsampled_label.core_box,
-                downsampled_label.page_text_line_mask,
-                downsampled_label.page_text_line_height_score_map,
-            )
+                downsampled_label.page_char_mask,
+                downsampled_label.page_char_height_score_map,
+            ))
+        return samples
 
 
 adaptive_scaling_pipeline_post_processor_factory = PipelinePostProcessorFactory(
@@ -55,42 +57,62 @@ class AdaptiveScalingIterableDataset(IterableDataset):
         self,
         steps_json: PathType,
         num_samples: int,
-        rng_seed: Optional[Union[int, Sequence[int]]] = None,
+        rng_seed: int,
+        num_processes: int,
+        num_runs_per_process: int = 8,
+        num_samples_reset_rng: Optional[int] = None,
+        is_dev: bool = False,
+        keep_dev_samples: bool = False,
     ):
         super().__init__()
 
-        logger.info('Creating pipeline...')
-        self.pipeline = Pipeline(
-            steps=pipeline_step_collection_factory.create(steps_json),
-            post_processor=adaptive_scaling_pipeline_post_processor_factory.create(),
-        )
-        logger.info('Pipeline created.')
+        logger.info('Creating pipeline pool...')
+        num_runs_reset_rng = None
+        if num_samples_reset_rng:
+            assert num_samples_reset_rng % num_processes == 0
+            num_runs_reset_rng = num_samples_reset_rng // num_processes
 
-        self.epoch_idx = 0
-        self.second_order_rng = SecondOrderRandomGenerator(
+        self.pipeline_pool = PipelinePool(
+            pipeline=Pipeline(
+                steps=pipeline_step_collection_factory.create(steps_json),
+                post_processor=adaptive_scaling_pipeline_post_processor_factory.create(),
+            ),
             rng_seed=rng_seed,
-            num_samples=num_samples,
+            num_processes=num_processes,
+            num_runs_per_process=num_runs_per_process,
+            num_runs_reset_rng=num_runs_reset_rng,
         )
+        logger.info('Pipeline pool created.')
+
+        self.num_samples = num_samples
+        self.is_dev = is_dev
+        self.keep_dev_samples = keep_dev_samples
+
+        self.dev_samples: List[Sample] = []
+        if self.is_dev and self.keep_dev_samples:
+            while len(self.dev_samples) < self.num_samples:
+                self.dev_samples.extend(self.pipeline_pool.run())
+            self.dev_samples = self.dev_samples[:self.num_samples]
+            self.pipeline_pool.cleanup()
 
     def __iter__(self):
-        samples_queue: List[Sample] = []
+        if self.is_dev and self.keep_dev_samples:
+            assert len(self.dev_samples) == self.num_samples
+            yield from self.dev_samples
+            return
 
-        for rng in self.second_order_rng.get_rngs(epoch_idx=self.epoch_idx):
-            if not samples_queue:
-                # Generate new samples based on rng.
-                while True:
-                    try:
-                        samples_queue.extend(self.pipeline.run(rng))
-                        break
-                    except Exception:
-                        logger.exception('pipeline failed. retrying...')
-                        # Force new rng.
-                        rng.random()
+        if self.is_dev:
+            self.pipeline_pool.reset()
 
-            assert samples_queue
-            yield samples_queue.pop()
+        cached_samples: List[Sample] = []
 
-        self.epoch_idx += 1
+        for _ in range(self.num_samples):
+            if not cached_samples:
+                cached_samples.extend(self.pipeline_pool.run())
+            yield cached_samples.pop()
+
+        if self.is_dev:
+            self.pipeline_pool.cleanup()
 
 
 def adaptive_scaling_dataset_collate_fn(batch: Iterable[Sample]):

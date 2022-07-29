@@ -1,9 +1,12 @@
 import torch
-from vkit_open_model.model.upernext import UperNext
+from vkit_open_model.model.upernext import UperNextNeck
 
 
 def test_upernext():
-    model = UperNext.create_tiny(100)
+    model = UperNextNeck(
+        in_channels_group=(96, 192, 384, 768),
+        out_channels=384,
+    )
     features = [
         torch.rand(1, 96, 80, 80),
         torch.rand(1, 192, 40, 40),
@@ -11,10 +14,7 @@ def test_upernext():
         torch.rand(1, 768, 10, 10),
     ]
     output = model(features)
-    assert output.shape == (1, 100, 80, 80)
+    assert output.shape == (1, 384, 80, 80)
 
-
-def test_upernext_jit():
-    model = UperNext.create_tiny(100)
     model_jit = torch.jit.script(model)  # type: ignore
     assert model_jit

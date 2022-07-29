@@ -1,9 +1,8 @@
-from typing import Dict, Set, Any
+from typing import Dict, Any
 import random
 
 import torch
 import numpy as np
-from numpy.random import default_rng
 
 
 def batch_to_device(batch: Dict[str, Any], device: torch.device):
@@ -40,27 +39,11 @@ def setup_seeds(
 
 
 def calculate_iterable_dataset_num_samples(
-    num_workers: int,
+    num_processes: int,
     batch_size: int,
     num_batches: int,
 ):
     num_samples = batch_size * num_batches
-    if num_workers > 0:
-        assert num_samples % num_workers == 0
+    if num_processes > 0:
+        assert num_samples % num_processes == 0
     return num_samples
-
-
-def generate_iterable_dataset_rng_seeds(num_samples: int, rng_seed: int):
-    rng = default_rng(rng_seed)
-
-    rng_seeds_set: Set[int] = set()
-    while len(rng_seeds_set) < num_samples:
-        seed: int = rng.bit_generator.state['state']['state']
-        rng_seeds_set.add(seed)
-        rng.random()
-
-    rng_seeds = list(rng_seeds_set)
-    rng.shuffle(rng_seeds)
-    assert len(rng_seeds) == num_samples
-
-    return rng_seeds

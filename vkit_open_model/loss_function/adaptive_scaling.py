@@ -58,7 +58,7 @@ class AdaptiveScalingLossFunction:
             gt=downsampled_mask,
         )
         loss += self.dice_factor * self.dice(
-            pred=mask_feature,
+            pred=torch.sigmoid(mask_feature),
             gt=downsampled_mask,
         )
 
